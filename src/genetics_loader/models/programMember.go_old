@@ -1,0 +1,1011 @@
+package models
+
+import (
+	"encoding/json"
+	"errors"
+	"github.com/dabfleming/gorm"
+	jp "github.com/dustin/go-jsonpointer"
+	"github.com/vincent-petithory/dataurl"
+	"golang.org/x/crypto/bcrypt"
+	"newtopia/driver/database"
+	"newtopia/imaging"
+	"newtopia/log"
+	"strings"
+	"time"
+	numberUtil "newtopia/util"
+)
+
+func init() {
+	member := ProgramMember{}
+	member.LoadUser("2b50c7f6-be39-449d-94f1-84402f58a6e2")
+
+	state, _ := member.GetUserState()
+	log.Println("USER STATE: ", state)
+}
+
+type programMemberData struct {
+	FirstName   string
+	LastName    string
+	DateOfBirth time.Time
+	Gender      string
+
+	Roles []string
+	//determineTCR Requirements
+
+	HeightInch float64
+	HeightCM   float64
+
+	WeightPound float64
+	WeightKG    float64
+
+	//getTotalCaloricRequirement(): Result of TCR
+	//	TotalCaloricRequirement nutritionData
+
+	//determineExerciseTargets requirements
+	ActiveMins float64 // From ExerciseIndendedDurationRoutine || ExerciseIndendedDurationNoRoutine
+	ActiveDays float64 // From ExerciseFrequency
+
+	//getExerciseTargets() ExerciseTargets exerciseData
+
+	//determineDiet requriements
+
+	PreferredDiet string
+
+	//determinePersonalitySubtype
+
+	EmotionBasedValues []float64
+
+	OpportunityValues []float64
+
+	AllOrNoneValues []float64
+
+	//GENERATE AS RETURN OF FUNCTION Personality personalityData
+
+	//getWellbeingIndicatorValues reqs
+
+	MoodValue    int
+	SleepValue   int
+	EnergyValue  int
+	StressValue  int
+	AnxietyValue int
+
+	WellbeingDiffValues []map[string]interface{}
+	//	WellbeingGoal string
+
+	//getActivityLevel
+
+	ExerciseReadiness           float64
+	ExerciseShortTermIntentions float64
+	ExerciseFrequency           float64
+
+	//	ActivityType string
+
+}
+
+type ProgramMember struct {
+	user User
+	data programMemberData
+}
+
+func NewProgramMember(request map[string]interface{}) (*ProgramMember, error) {
+
+	// Check if consent exists
+	log.Print("Checking request object for consent")
+
+	CSAConsent := jp.Get(request, "/ExpressConsentCSA/value")
+	GeneticConsent := jp.Get(request, "/ExpressConsentGenetic/value")
+
+	if CSAConsent == nil || GeneticConsent == nil {
+		log.Print("Consent not found")
+		return nil, errors.New("Consent Not Accepted")
+	} else if CSAConsent.(float64) != 1 && GeneticConsent.(float64) != 1 {
+		return nil, errors.New("Consent Not Given")
+	}
+
+	// Check if email, Password, memberId and DateOfBirth exist
+
+	Email := jp.Get(request, "/EmailAddress/value")
+	Password := jp.Get(request, "/Password/value")
+	DateOfBirth := jp.Get(request, "/DateOfBirth/value")
+	MemberId := jp.Get(request, "/InsuranceID/value")
+
+	if Email == nil || Password == nil || DateOfBirth == nil || MemberId == nil {
+		log.Print("Critical information not found")
+		return nil, errors.New("Missing critical information: Email, Password, DateOfBirth or MemberId")
+	}
+
+	DateOfBirthStr := DateOfBirth.(string)
+	log.Print("DateOfBirth is :  ", DateOfBirthStr)
+
+	DateOfBirthTime, err := time.Parse("2006-01-02T15:04:05.999Z07:00", DateOfBirthStr)
+
+	if err != nil {
+		DateOfBirthTime, err = time.Parse("01/02/2006", DateOfBirthStr)
+		if err != nil {
+
+			DateOfBirthTime, err = time.Parse("1/2/06", DateOfBirthStr)
+			if err != nil {
+				return nil, errors.New("Invalid date of birth time format")
+			}
+		}
+	}
+
+	// Check if user exists as an intake
+	log.Print("Checking if the user is an eligible intake user")
+
+	db := database.App
+
+	onboardingRecord := Record{}
+	//Checking in the records for an Intake record with the right member_id and date_of_birth as time (PSQL will properly handle the date if CAST(... as date) is maintained)
+	err = db.Where("entity_id = (select id from entities where name='Intake') and meta #>> '{member_id}' = ? and CAST(meta #>> '{date_of_birth}' as date) = ?", MemberId, DateOfBirthTime).First(&onboardingRecord).Error
+
+	if err != nil {
+		log.Print("Invalid intake user: ", err)
+		return nil, errors.New("Invalid intake")
+	}
+
+	// user registration is valid get the user
+
+	user := User{}
+
+	UserChangesTx := database.App.Begin()
+	if UserChangesTx.Error != nil {
+		log.Print(UserChangesTx.Error)
+		return nil, errors.New("Unkown error")
+	}
+
+	err = db.Where("user_id = ?", onboardingRecord.UserId).First(&user).Error
+
+	if err != nil {
+		return nil, errors.New("Invalid intake")
+	}
+
+	// First set the email if it doesn't exist
+
+	var userEmail UserEmail
+	err = db.Where("email = ?", Email.(string)).Find(&userEmail).Error
+	if err == gorm.RecordNotFound {
+		userEmail = UserEmail{
+			UserId: user.UserId,
+			Email:  Email.(string),
+		}
+		log.Print(userEmail)
+		err = UserChangesTx.Create(&userEmail).Error
+		if err != nil {
+			log.Print(err)
+			return nil, errors.New("Error creating user email")
+		}
+	} else {
+		// Email record exists, check that it's for same user
+		if userEmail.UserId.String() != user.UserId.String() {
+			return nil, errors.New("Email address already in use by another user.")
+		}
+	}
+
+	// Create participant with password
+	hash, err := bcrypt.GenerateFromPassword([]byte(Password.(string)), 10)
+
+	if err != nil {
+		log.Print("Password hash error.", err)
+		return nil, errors.New("Error creating user")
+	}
+
+	// Set the Password Hash! CRITICAL
+	user.Password = hash
+	// CRITICAL above
+
+	// UserAddress
+
+	// Check if we have any request data that is right for address
+
+	// City and State come from a dropdown so we should take the payload data
+	AddressLine1 := jp.Get(request, "/AddressLine1/value")
+	AddressLine2 := jp.Get(request, "/AddressLine2/value")
+	AddressCity := jp.Get(request, "/AddressCity/text")
+	AddressState := jp.Get(request, "/AddressState/text")
+	AddressZip := jp.Get(request, "/AddressZip/value")
+	AddressCountry := jp.Get(request, "/AddressCountry/value")
+
+	var AddressLine1Str, AddressLine2Str, AddressCityStr, AddressStateStr, AddressZipStr, AddressPlus4Str, AddressCountryStr string
+
+	if AddressLine1 != nil {
+		AddressLine1Str = AddressLine1.(string)
+	}
+
+	if AddressLine2 != nil {
+		AddressLine2Str = AddressLine2.(string)
+	}
+
+	if AddressState != nil {
+		AddressStateStr = AddressState.(string)
+	}
+
+	if AddressZip != nil {
+		AddressZipStr = AddressZip.(string)
+		if len(AddressZipStr) > 5 {
+			log.Print("Zip code was greater then 5 characters. Assuming plus4")
+			// For unicode ... we should use []rune but Zip shoulde be a string of numbers
+			// so ... eh!
+
+			var splitZip = strings.Split("-", AddressZipStr)
+
+			if len(splitZip) > 1 {
+				//get the first 4 chracters of the split
+				AddressPlus4Str = splitZip[1][0:4]
+				AddressZipStr = splitZip[0][0:5]
+			} else {
+				//WTF ... ok fuck it let's save it anyhow
+				// the results will be in the registration record anyway
+				// Take a slice of the last 4 characters
+				AddressPlus4Str = AddressZipStr[len(AddressZipStr)-4:]
+
+				// Take a slice of the first 5 chracters
+				AddressZipStr = AddressZipStr[0:5]
+			}
+		}
+	}
+
+	if AddressCity != nil {
+		AddressCityStr = AddressCity.(string)
+	}
+
+	if AddressCountry != nil {
+		AddressCountryStr = AddressCountry.(string)
+	} else {
+		AddressCountryStr = "United States"
+	}
+
+	userAddress := UserAddress{
+		UserId:       user.UserId,
+		Name:         "RegistrationAddress",
+		AddressLine1: AddressLine1Str,
+		AddressLine2: AddressLine2Str,
+		City:         AddressCityStr,
+		State:        AddressStateStr,
+		Zipcode:      AddressZipStr,
+		Plus4:        AddressPlus4Str,
+		Country:      AddressCountryStr,
+	}
+
+	err = UserChangesTx.Create(&userAddress).Error
+
+	if err != nil {
+		log.Print("Couldn't save address")
+
+		UserChangesTx.Rollback()
+		return nil, errors.New("Couldn't save address")
+
+	}
+
+	DisplayName := jp.Get(request, "/DisplayName/value")
+	if DisplayName != nil {
+		user.DisplayName = DisplayName.(string)
+	}
+
+	PhotoSelect := jp.Get(request, "/SelectAvatar/value")
+	PhotoUpload := jp.Get(request, "/UploadPhoto/value")
+
+	log.Print(PhotoSelect, PhotoUpload)
+
+	// Profile Image
+	var imgType string
+	var imgData string
+
+	if PhotoSelect != nil {
+		// User selected a canned avatar
+		// TODO Need source data for these avatars to store in the same was as custom ones
+		// Temporary hack
+		imgType = "premade"
+		imgData = PhotoSelect.(string)
+	} else if PhotoUpload != nil {
+		// User uploaded a custom avatar
+		imgType = "custom"
+		img, err := processUploadedAvatarWithTx(user, PhotoUpload.(string), UserChangesTx)
+		if err != nil {
+			log.Printf("Error in processUploadedAvatar(): %v", err)
+			UserChangesTx.Rollback()
+			return nil, errors.New("Error processing uploaded image")
+		}
+		imgData = string(img.Base64())
+	} else {
+
+		return nil, errors.New("Error Processing avatar image")
+	}
+
+	// Remove password from the request before it is stored
+	delete(request, "Password")
+	delete(request, "ConfirmPassword")
+
+	// Remove avatar props from the request
+	delete(request, "ProfilePhoto")
+	delete(request, "UploadPhoto")
+	delete(request, "SelectAvatar")
+
+	var meta Metadata
+
+	b, err := json.Marshal(request)
+	if err != nil {
+		UserChangesTx.Rollback()
+
+		log.Print("Error usermarshalling user data")
+		return nil, errors.New("Error processing request")
+	}
+
+	err = json.Unmarshal(b, &meta)
+	if err != nil {
+		UserChangesTx.Rollback()
+		log.Print("Error usermarshalling user data")
+		return nil, errors.New("Error processing request")
+	}
+	// Store thumbnail in the meta
+	meta["avatar"] = map[string]interface{}{
+		"type": imgType,
+		"data": imgData,
+	}
+
+	user.Meta = meta
+
+	// Update the primary Address before continuing. Swaps and keeps old email
+	user.PrimaryEmailId = userEmail.ID
+	err = UserChangesTx.Save(&user).Error
+	if err != nil {
+		UserChangesTx.Rollback()
+
+		log.Print("Error saving updated user.", err)
+		return nil, errors.New("Error creating user email")
+	}
+
+	activeRegEntity := Entity{}
+
+	err = db.Where("name = 'Registration' and CAST(meta #>> '{active}' as BOOLEAN)").First(&activeRegEntity).Error
+
+	if err != nil {
+		UserChangesTx.Rollback()
+
+		log.Print("Error saving updated user's record: ", err)
+		return nil, errors.New("Error creating user registration record")
+	}
+
+	registrationRecord := Record{
+		EntityId: activeRegEntity.ID,
+		TypeId:   activeRegEntity.TypeId,
+		Meta:     meta,
+		UserId:   user.UserId,
+		RecordAt: time.Now(),
+	}
+
+	err = UserChangesTx.Create(&registrationRecord).Error
+
+	if err != nil {
+		UserChangesTx.Rollback()
+
+		log.Print("Error saving updated user's record: ", err)
+		return nil, errors.New("Error creating user registration record")
+	}
+
+	// Create onboarding record with data
+	// Set userlog & userState
+	// Log
+	err = user.AddLogWithTx("onboarding.registration", "Registration completed.", nil, UserChangesTx)
+	if err != nil {
+		UserChangesTx.Rollback()
+
+		log.Print("Error adding user log.", err)
+		return nil, errors.New("Error saving registration log")
+	}
+
+	// State
+	err = user.SetStateWithTx("status", "registered", UserChangesTx)
+	if err != nil {
+		UserChangesTx.Rollback()
+
+		log.Print("Error setting user state.", err)
+		return nil, errors.New("Error saving registration state")
+	}
+
+	//Create session
+
+	err = user.AddRoleWithTx("Participant", UserChangesTx)
+
+	if err != nil {
+		UserChangesTx.Rollback()
+
+		log.Print("Error setting user role.", err)
+		return nil, errors.New("Error saving user role")
+	}
+
+	// Commit tx
+	err = UserChangesTx.Commit().Error
+	if err != nil {
+		UserChangesTx.Rollback()
+
+		log.Print(err)
+		return nil, errors.New("Error saving user changes")
+	} else {
+		// everything commit safely let's set the registration record measure to be done
+		// TODO
+	}
+
+	return &ProgramMember{user: user}, nil
+}
+
+func (p *ProgramMember) SaveAssessment(request map[string]interface{}) error {
+
+	db := database.App
+
+	existRecord := Record{}
+
+	// If front end sends a version ... use it to get record
+	// Or else assume latest
+	entity_version := jp.Get(request, "/_version")
+
+	var err error
+
+	var assEntity Entity
+
+	if entity_version != nil {
+
+		err = db.Where("name='Assessment' and meta #>> '{version}' = ?", entity_version.(string)).First(&assEntity).Error
+
+	} else {
+
+		err = db.Where("name='Assessment' and CAST(meta #>> '{active}' as BOOLEAN)").First(&assEntity).Error
+
+	}
+
+	if err != nil {
+		log.Print("Cannot get assessment entity")
+		return errors.New("Unkown error")
+
+	}
+	err = db.Where("entity_id = ? and user_id= ? ", assEntity.ID, p.user.UserId).First(&existRecord).Error
+
+	var measures []Measure
+	db.Model(&assEntity).Association("Measures").Find(&measures)
+	assEntity.Measures = measures
+
+	// Update meta
+	var meta Metadata
+
+	b, parseErr := json.Marshal(request)
+	if parseErr != nil {
+		log.Print("Error usermarshalling user data")
+		return errors.New("Error processing request")
+	}
+
+	parseErr = json.Unmarshal(b, &meta)
+	if parseErr != nil {
+		log.Print("Error usermarshalling user data")
+		return errors.New("Error processing request")
+	}
+
+	existRecord.Meta = meta
+
+	if err == gorm.RecordNotFound {
+		newRecord := Record{}
+		err = newRecord.CreateFromEntity(&assEntity)
+		newRecord.TypeId = assEntity.TypeId
+		newRecord.UserId = p.user.UserId
+		newRecord.SetMeasureValue("done", 0)
+		newRecord.Meta = meta
+		newRecord.RecordAt = time.Now()
+		//Create a new record
+		existRecord = newRecord
+	} else if err != nil {
+		log.Print("Unknown error trying to get registration record ", err)
+		return errors.New("Unkown err")
+	}
+
+	if val, _ := existRecord.GetMeasureValue("done"); val == 1 {
+		return errors.New("Assessment is done! Cannot update")
+	}
+
+	err = db.Save(&existRecord).Error
+
+	if err != nil {
+		log.Print("Couldn't updated user record: ", err)
+		return errors.New("Unkown err")
+	}
+
+	return nil
+}
+
+
+
+func (p *ProgramMember) processInitialAssessment(assessmentRecord Record) error {
+	var err error = nil
+
+//	log.Println("######### processInitialAssessment() ##################################")
+//	log.Print(assessmentRecord.Meta)
+
+	err = p.processAssessmentWeight(assessmentRecord)
+	if err != nil {
+		log.Println("Error with processAssessmentWeight() : ", err.Error())
+		return err
+	}
+
+	err = p.processAssessmentHeight(assessmentRecord)
+	if err != nil {
+		log.Println("Error with processAssessmentHeight() : ", err.Error())
+		return err
+	}
+
+	// TODO: VALIDIC PROVISIONING...
+
+
+	return err
+}
+
+
+
+func (p *ProgramMember) processAssessmentWeight(assessmentRecord Record) error {
+	var err error = nil
+	var meta Metadata = assessmentRecord.Meta
+	db := database.App
+
+	var weightKeyPath string
+	var weightFactor float64
+	var weightValue float64
+	var weightPoundsValue float64
+	var weightEntity Entity
+	var weightRecord Record = Record{}
+
+	weightUnitsInterface := jp.Get(meta, "/WeightUnits/value")
+
+	if weightUnitsInterface != nil {
+		weightUnits := weightUnitsInterface.(float64)
+		switch weightUnits {
+			case 0:
+				weightKeyPath = "/WeightKGs/value"
+				weightFactor = 2.20462
+			case 1:
+				weightKeyPath = "/WeightPounds/value"
+				weightFactor = 1
+			default:
+				return errors.New("could not process WeightUnits from assessment record meta")
+		}
+	} else {
+		return errors.New("no key 'WeightUnits' in record meta")
+	}
+
+	weightValueInterface := jp.Get(meta, weightKeyPath)
+
+	if weightValueInterface != nil {
+		weightValue = weightValueInterface.(float64)
+	} else {
+		return errors.New("could not find weight key in record meta")
+	}
+
+	weightPoundsValue = weightValue * weightFactor
+	weightPoundsValue = numberUtil.RoundTo(weightPoundsValue, 1)
+
+	err = db.Where("name = ?", "Weight").Preload("Type").First(&weightEntity).Error
+	if err != nil {
+		log.Print(err)
+		return err
+	}
+
+	err = weightRecord.CreateFromEntity(&weightEntity)
+	if err != nil {
+		log.Print(err)
+		return err
+	}
+
+	weightRecord.SetMeasureValue("weight", weightPoundsValue)
+	weightRecord.UserId = p.user.UserId
+	weightRecord.TypeId = weightEntity.TypeId
+	weightRecord.RecordAt = time.Now()
+
+	log.Println("WEIGHT RECORD ###########################")
+	log.Print(weightRecord)
+
+	err = weightRecord.Save()
+	if err != nil {
+		log.Println("Error saving weight record: ", err.Error())
+	}
+
+	return err
+}
+
+
+func (p *ProgramMember) processAssessmentHeight(assessmentRecord Record) error {
+	var err error = nil
+	var meta Metadata = assessmentRecord.Meta
+	db := database.App
+
+	var cmToInchFactor float64 = 0.393701
+	var heightType string = "" // metric || imperial
+	var heightValue float64
+	var heightEntity Entity
+	var heightRecord Record = Record{}
+
+	heightUnitsInterface := jp.Get(meta, "/HeightUnits/value")
+
+	if heightUnitsInterface != nil {
+		heightUnits := heightUnitsInterface.(float64)
+		switch heightUnits {
+		case 0: // cm
+			heightType = "metric"
+		case 1: // ft & inches
+			heightType = "imperial"
+		default:
+			return errors.New("could not process HeightUnits from assessment record meta")
+		}
+	} else {
+		return errors.New("no key 'HeightUnits' in record meta")
+	}
+
+	var heightCentimeters float64
+	var heightFeet float64
+	var heightInches float64
+
+	if heightType == "metric" {
+		heightCmInterface := jp.Get(meta, "/HeightCMs/value")
+		if heightCmInterface != nil {
+			heightCentimeters = heightCmInterface.(float64)
+		} else {
+			return errors.New("could not find HeightCMs key in record meta")
+		}
+
+		heightValue = heightCentimeters * cmToInchFactor
+		heightValue = numberUtil.RoundTo(heightValue, 1)
+
+	} else if heightType == "imperial" {
+		heightFeetInterface := jp.Get(meta, "/HeightFeet/value")
+		heightInchesInterface := jp.Get(meta, "/HeightInches/value")
+
+		if heightFeetInterface != nil && heightInchesInterface != nil {
+			heightFeet = heightFeetInterface.(float64)
+			heightInches = heightInchesInterface.(float64)
+		} else {
+			return errors.New("could not find HeightFeet and/or HeightInches key(s) in record meta")
+		}
+
+		heightValue = heightFeet * 12
+		heightValue = heightValue + heightInches
+		heightValue = numberUtil.RoundTo(heightValue, 1)
+	}
+
+	err = db.Where("name = ?", "Height").Preload("Type").First(&heightEntity).Error
+	if err != nil {
+		log.Print(err)
+		return err
+	}
+
+	err = heightRecord.CreateFromEntity(&heightEntity)
+	if err != nil {
+		log.Print(err)
+		return err
+	}
+
+	heightRecord.SetMeasureValue("height", heightValue)
+	heightRecord.UserId = p.user.UserId
+	heightRecord.TypeId = heightEntity.TypeId
+	heightRecord.RecordAt = time.Now()
+
+	log.Println("HEIGHT RECORD ###########################")
+	log.Print(heightRecord)
+
+	err = heightRecord.Save()
+	if err != nil {
+		log.Println("Error saving height record: ", err.Error())
+	}
+
+	return err
+}
+
+
+func (p *ProgramMember) Assess(request map[string]interface{}) error {
+	db := database.App
+
+	existRecord := Record{}
+
+	// If front end sends a version ... use it to get record
+	// Or else assume latest
+	entity_version := jp.Get(request, "/_version")
+
+	var err error
+
+	var assEntity Entity
+
+	if entity_version != nil {
+
+		err = db.Where("name='Assessment' and meta #>> '{version}' = ?", entity_version.(string)).First(&assEntity).Error
+
+	} else {
+
+		err = db.Where("name='Assessment' and CAST(meta #>> '{active}' as BOOLEAN)").First(&assEntity).Error
+
+	}
+
+	if err != nil {
+		log.Print("Cannot get assessment entity")
+		return errors.New("Unkown error")
+
+	}
+
+	var measures []Measure
+	db.Model(&assEntity).Association("Measures").Find(&measures)
+	assEntity.Measures = measures
+
+	err = db.Where("entity_id = ? and user_id= ? ", assEntity.ID, p.user.UserId).First(&existRecord).Error
+
+	// Update meta
+	var meta Metadata
+
+	b, parseErr := json.Marshal(request)
+	if parseErr != nil {
+		log.Print("Error usermarshalling user data")
+		return errors.New("Error processing request")
+	}
+
+	parseErr = json.Unmarshal(b, &meta)
+	if parseErr != nil {
+		log.Print("Error usermarshalling user data")
+		return errors.New("Error processing request")
+	}
+
+	existRecord.Meta = meta
+
+	if err == gorm.RecordNotFound {
+		newRecord := Record{}
+		err = newRecord.CreateFromEntity(&assEntity)
+		newRecord.TypeId = assEntity.TypeId
+		newRecord.UserId = p.user.UserId
+		newRecord.SetMeasureValue("done", 0)
+		newRecord.Meta = meta
+		newRecord.RecordAt = time.Now()
+		//Create a new record
+		existRecord = newRecord
+	} else if err != nil {
+		log.Print("Unknown error trying to get registration record ", err)
+		return errors.New("Unkown err")
+	}
+
+	if val, _ := existRecord.GetMeasureValue("done"); val == 1 {
+		return errors.New("Assessment is done! Cannot update")
+	}
+	existRecord.SetMeasureValue("done", 1)
+
+	err = db.Save(&existRecord).Error
+
+	if err != nil {
+		log.Print("Couldn't updated user record: ", err)
+		return errors.New("Unkown err")
+	}
+
+	err = p.processInitialAssessment(existRecord)
+	if err != nil {
+		log.Print("Error processing assessment (processInitialAssessment()): ", err.Error())
+		return err
+	}
+
+	return nil
+}
+
+func (p *ProgramMember) LoadUser(userId string) (User, error) {
+	db := database.App
+	userObject := User{}
+
+	userUuid := UUID{}
+	userUuid.Parse(userId)
+
+	err := db.Where("user_id = ? ", userUuid).First(&userObject).Error
+	if err != nil {
+		log.Println("Cannot find user by uuid : ", err.Error())
+		return userObject, err
+	}
+
+	log.Print("Found user:", userObject)
+
+	p.user = userObject
+	return p.user, nil
+}
+
+
+
+/***
+	FirstName   string
+	LastName    string
+	DateOfBirth time.Time
+	Gender      string
+
+	Roles []string
+	//determineTCR Requirements
+
+	HeightInch float64 -----------
+	HeightCM   float64 -----------
+
+	WeightPound float64 -----------
+	WeightKG    float64 -----------
+
+	//getTotalCaloricRequirement(): Result of TCR
+	//	TotalCaloricRequirement nutritionData
+
+	//determineExerciseTargets requirements
+	ActiveMins float64 // From ExerciseIndendedDurationRoutine || ExerciseIndendedDurationNoRoutine
+	ActiveDays float64 // From ExerciseFrequency
+
+	//getExerciseTargets() ExerciseTargets exerciseData
+
+	//determineDiet requriements
+
+	PreferredDiet string
+
+	//determinePersonalitySubtype
+
+	EmotionBasedValues []float64
+
+	OpportunityValues []float64
+
+	AllOrNoneValues []float64
+
+	//GENERATE AS RETURN OF FUNCTION Personality personalityData
+
+	//getWellbeingIndicatorValues reqs
+
+	MoodValue    int
+	SleepValue   int
+	EnergyValue  int
+	StressValue  int
+	AnxietyValue int
+
+	WellbeingDiffValues []map[string]interface{}
+	//	WellbeingGoal string
+
+	//getActivityLevel
+
+	ExerciseReadiness           float64
+	ExerciseShortTermIntentions float64
+	ExerciseFrequency           float64
+
+
+ ***/
+
+
+
+
+func (p *ProgramMember) LoadMemberData() (err error) {
+	err = nil
+	db := database.App
+
+	var heightEntity Entity = Entity{}
+	var weightEntity Entity = Entity{}
+	var heightRecord Record = Record{}
+	var weightRecord Record = Record{}
+
+	// ======================================================
+	// HEIGHT AND WEIGHT RECORDS
+	// ======================================================
+	err = heightEntity.CreateByName("Height")
+	err = weightEntity.CreateByName("Weight")
+
+	if err != nil {
+		log.Println("Error creating height and/or weight entities: ", err.Error())
+		return err
+	}
+	// load the user's LATEST height record
+	err = db.Where("user_id = ? AND entity_id = ? ", p.user.UserId, heightEntity.ID).Last(&heightRecord).Error
+	if err != nil {
+		log.Println("Could not get height record for user: ", err.Error())
+		return err
+	}
+	// load the user's LATEST weight record
+	err = db.Where("user_id = ? AND entity_id = ? ", p.user.UserId, weightEntity.ID).Last(&weightRecord).Error
+	if err != nil {
+		log.Println("Could not get weight record for user: ", err.Error())
+		return err
+	}
+
+	// set programMemberData HeightInch/WeightPound from their respective
+	// record's MeasureData
+	p.data.HeightInch, err = heightRecord.GetMeasureValue("height")
+	p.data.WeightPound, err = weightRecord.GetMeasureValue("weight")
+
+	if err != nil {
+		log.Println("Could not get measure values for height and/or weight from the respective records: ", err.Error())
+		return err
+	}
+
+	// convert height to centimeters and set
+	heightCm := p.data.HeightInch * (1/0.393701)
+	heightCm = numberUtil.RoundTo(heightCm, 1)
+	p.data.HeightCM = heightCm
+	// convert weight to kilograms and set
+	weightKg := p.data.WeightPound * (1/2.20462)
+	weightKg = numberUtil.RoundTo(weightKg, 1)
+	p.data.WeightKG = weightKg
+
+
+
+	return
+}
+
+func (p *ProgramMember) IsLead() bool {
+	state, _ := p.GetUserState()
+	if state == "lead" {
+		return true
+	}
+	return false
+}
+
+func (p *ProgramMember) IsParticipant() bool {
+	state, _ := p.GetUserState()
+	if state == "registered" || state == "assessed" || state == "active" {
+		return true
+	}
+	return false
+}
+
+func (p *ProgramMember) IsActive() bool {
+	state, _ := p.GetUserState()
+	if state == "active" {
+		return true
+	}
+	return false
+
+}
+
+func (p *ProgramMember) GetUserState() (state string, err error) {
+	db := database.App
+	state = ""
+	err = nil
+
+	var userState UserState
+
+	err = db.Where(UserState{UserId: p.user.UserId, Type: "status"}).Order("created_at desc").First(&userState).Error
+	if err != nil {
+		log.Println("Cannot get user state : ", err.Error())
+		return
+	}
+
+	return userState.State, nil
+}
+
+func (p *ProgramMember) GetUser() (user User) {
+	user = p.user
+	return
+}
+
+func (p *ProgramMember) StartSession() (session Session, err error) {
+	db := database.App
+	sessionModel := Session{UserId: p.user.UserId}
+	err = db.Create(&sessionModel).Error
+	db.First(&sessionModel, sessionModel.ID) // Load full contents
+	return
+}
+
+func processUploadedAvatarWithTx(user User, input string, tx *gorm.DB) (*imaging.Image, error) {
+	// Parse input string (data uri)
+	dataURL, err := dataurl.DecodeString(input)
+	if err != nil {
+		return nil, err
+	}
+
+	// Image
+	img := imaging.FromBytes(dataURL.Data)
+
+	// Save original
+	// Create asset model
+	asset := UserAsset{
+		UserId: user.UserId,
+		Type:   "original avatar",
+		Data:   img.Bytes(),
+	}
+
+	// Save
+	err = tx.Save(&asset).Error
+	if err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+
+	// Make Thumbnail
+	thumb, err := img.Thumbnail()
+	if err != nil {
+		return nil, err
+	}
+
+	// Return thumbnail
+	return thumb, nil
+}
